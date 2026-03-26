@@ -1,0 +1,8 @@
+torch
+transformers
+accelerate
+deepspeed
+safetensors
+datasets
+latex2sympy2-extended
+math-verify
