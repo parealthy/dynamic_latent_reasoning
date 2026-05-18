@@ -72,9 +72,38 @@ def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str]
     return rewards
 
 
-def length_penalty_reward(
+def trajectory_efficiency_reward(
     completions: list[list[dict[str, str]]],
-    max_completion_length: int = 1024,
+    solution: list[str],
+    trajectory_lengths: list[int] | None = None,
+    max_trajectory_length: int = 256,
+    efficiency_weight: float = 0.3,
+    **kwargs,
+) -> list[float]:
+    """
+    Rewards using a shorter latent trajectory *when the answer is correct*.
+
+    Returns efficiency_weight * (1 - k/max_trajectory_length) for correct
+    completions and 0.0 otherwise.  Combined with accuracy_reward this
+    incentivises the DifficultyEstimator to choose smaller k for easy problems.
+
+    Only meaningful when trajectory_lengths is provided (i.e. during adaptive
+    GRPO training).  Falls back to all-zero if trajectory_lengths is None.
+    """
+    if trajectory_lengths is None:
+        return [0.0] * len(completions)
+
+    acc = accuracy_reward(completions=completions, solution=solution, **kwargs)
+    rewards = []
+    for a, k in zip(acc, trajectory_lengths):
+        if a is None or a == 0.0:
+            rewards.append(0.0)
+        else:
+            rewards.append(float(efficiency_weight * (1.0 - k / max_trajectory_length)))
+    return rewards
+
+
+def length_penalty_reward(
     completion_token_lengths: list[int] | None = None,
     **kwargs,
 ) -> list[float]:

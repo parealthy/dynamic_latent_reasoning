@@ -18,9 +18,14 @@ if LOCAL_TRL_PATH not in sys.path:
 from trl import GRPOConfig
 
 from modeling.reason import LatentTransformerReasoningModel, TransformerReasoningNet
+from modeling.adaptive_reason import (
+    AdaptiveTransformerReasoningNet,
+    AdaptiveLatentGRPOModel,
+)
 from trainer.grpo_trainer import GRPOTrainer
+from trainer.adaptive_grpo_trainer import AdaptiveGRPOTrainer
 from utils.load_data import load_train_data
-from utils.reward_func import accuracy_reward, length_penalty_reward
+from utils.reward_func import accuracy_reward, length_penalty_reward, trajectory_efficiency_reward
 
 
 REWARD_FNS: dict[str, Callable[..., list[Optional[float]]]] = {
@@ -35,6 +40,16 @@ class CustomGRPOConfig(GRPOConfig):
     slow_thinking_model_path: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
     reasoning_net_path: str = "Qwen/Qwen3-Embedding-0.6B"
     latent_trajectory_length: int = 256
+    # ---- Adaptive Latent Trajectory (ALT) ----
+    use_adaptive_length: bool = False
+    length_candidates: str = ""          # e.g. "64,128,192,256"
+    diff_sample_temperature: float = 1.0 # exploration temp for DifficultyEstimator
+    diff_reinforce_weight: float = 0.05  # λ for REINFORCE aux loss
+    # Trajectory cost reward weight. Controls the strength of the "short-k
+    # preference" signal injected into GRPO advantage. Without this, the
+    # DifficultyEstimator only learns "which k is easier to answer correctly",
+    # NOT "the shortest k that still answers correctly".
+    trajectory_efficiency_weight: float = 0.3
     resume_from_checkpoint: Optional[str] = None
 
     dataset_name: str = "BytedTsinghua-SIA/DAPO-Math-17k"
@@ -165,6 +180,47 @@ def build_length_penalty(max_completion_length: int):
 
     length_penalty_wrapper.__name__ = "length_penalty"
     return length_penalty_wrapper
+
+
+def build_trajectory_efficiency(
+    model,
+    max_trajectory_length: int,
+    efficiency_weight: float = 0.3,
+):
+    """
+    Trajectory cost reward that closes over the adaptive model.
+
+    At call time it pulls model._last_trajectory_lengths (set during
+    generate() in AdaptiveLatentGRPOModel) and combines with accuracy.
+    Adding this reward to the GRPO objective is what teaches the
+    DifficultyEstimator to actually prefer *shorter* k — without it,
+    GRPO's group-normalised advantage cannot distinguish
+    "correct with k=64" from "correct with k=256".
+
+    Returns:
+        per-sample reward: efficiency_weight * (1 - k/max) if correct, else 0
+    """
+
+    def reward_wrapper(prompts, completions, solution, **kwargs):
+        del prompts
+        traj_lens = getattr(model, "_last_trajectory_lengths", None)
+        if traj_lens is None:
+            return [0.0] * len(completions)
+        if hasattr(traj_lens, "tolist"):
+            traj_lens = traj_lens.tolist()
+        else:
+            traj_lens = list(traj_lens)
+        return trajectory_efficiency_reward(
+            completions=completions,
+            solution=solution,
+            trajectory_lengths=traj_lens,
+            max_trajectory_length=max_trajectory_length,
+            efficiency_weight=efficiency_weight,
+            **kwargs,
+        )
+
+    reward_wrapper.__name__ = "trajectory_efficiency"
+    return reward_wrapper
 
 
 class LatentTransformerReasoningForGRPO(LatentTransformerReasoningModel):
@@ -569,6 +625,13 @@ class LatentTransformerReasoningForGRPO(LatentTransformerReasoningModel):
         return completion_ids
 
 
+def _parse_length_candidates(args: CustomGRPOConfig) -> list[int]:
+    if args.length_candidates:
+        return sorted(int(x.strip()) for x in args.length_candidates.split(","))
+    step = max(args.latent_trajectory_length // 4, 1)
+    return [step * i for i in range(1, 5) if step * i <= args.latent_trajectory_length]
+
+
 def build_model(training_args: CustomGRPOConfig, tokenizer):
     device_map = _build_device_map()
     slow_reasoning_model = AutoModelForCausalLM.from_pretrained(
@@ -586,11 +649,32 @@ def build_model(training_args: CustomGRPOConfig, tokenizer):
         hidden_size=_resolve_hidden_size(slow_reasoning_model.config),
     ).to(next(slow_reasoning_model.parameters()).device)
 
-    model = LatentTransformerReasoningForGRPO(
-        slow_reasoning_model=slow_reasoning_model,
-        processor=tokenizer,
-        reasoning_network=reasoning_network,
-    )
+    if training_args.use_adaptive_length:
+        length_candidates = _parse_length_candidates(training_args)
+        print(f"[ALT-GRPO] Adaptive length with candidates={length_candidates}, "
+              f"diff_temperature={training_args.diff_sample_temperature}")
+        reasoning_network = AdaptiveTransformerReasoningNet(
+            training_args.reasoning_net_path,
+            latent_trajectory_length=training_args.latent_trajectory_length,
+            hidden_size=_resolve_hidden_size(slow_reasoning_model.config),
+            length_candidates=length_candidates,
+        ).to(next(slow_reasoning_model.parameters()).device)
+
+        base_model = LatentTransformerReasoningForGRPO(
+            slow_reasoning_model=slow_reasoning_model,
+            processor=tokenizer,
+            reasoning_network=reasoning_network,
+        )
+        model = AdaptiveLatentGRPOModel(
+            base_grpo_model=base_model,
+            diff_sample_temperature=training_args.diff_sample_temperature,
+        )
+    else:
+        model = LatentTransformerReasoningForGRPO(
+            slow_reasoning_model=slow_reasoning_model,
+            processor=tokenizer,
+            reasoning_network=reasoning_network,
+        )
     load_checkpoint_if_needed(model, training_args.resume_from_checkpoint)
     return model
 
@@ -627,14 +711,32 @@ def main():
     reward_fns.append(length_penalty_fn)
     reward_weights.append(LENGTH_PENALTY_WEIGHT)
 
+    # ALT: trajectory cost reward — essential for teaching DifficultyEstimator
+    # to prefer the shortest k that still answers correctly. Without it,
+    # GRPO advantage cannot distinguish (correct, k=64) from (correct, k=256).
+    if training_args.use_adaptive_length:
+        eff_fn = build_trajectory_efficiency(
+            model=model,
+            max_trajectory_length=training_args.latent_trajectory_length,
+            efficiency_weight=training_args.trajectory_efficiency_weight,
+        )
+        reward_fns.append(eff_fn)
+        reward_weights.append(1.0)  # absolute scale already controlled by efficiency_weight
+
     training_args.reward_weights = reward_weights
 
-    trainer = GRPOTrainer(
+    TrainerClass = AdaptiveGRPOTrainer if training_args.use_adaptive_length else GRPOTrainer
+    trainer_kwargs = {}
+    if training_args.use_adaptive_length:
+        trainer_kwargs["diff_reinforce_weight"] = training_args.diff_reinforce_weight
+
+    trainer = TrainerClass(
         model=model,
         reward_funcs=reward_fns,
         args=training_args,
         train_dataset=train_dataset,
         processing_class=tokenizer,
+        **trainer_kwargs,
     )
 
     trainer.train()

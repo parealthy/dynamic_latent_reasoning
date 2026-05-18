@@ -22,6 +22,7 @@ if LOCAL_TRL_PATH not in sys.path:
 from trl import SFTConfig
 
 from modeling.reason import TransformerReasoningNet, LatentTransformerReasoningModel
+from modeling.adaptive_reason import AdaptiveTransformerReasoningNet, AdaptiveLatentSFTModel
 from utils.load_data import load_train_data
 
 
@@ -30,6 +31,14 @@ class CustomSFTConfig(SFTConfig):
     slow_thinking_model_path: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
     reasoning_net_path: str = "Qwen/Qwen3-Embedding-0.6B"
     latent_trajectory_length: int = 256
+    # ---- Adaptive Latent Trajectory (ALT) ----
+    # Set to True to enable Matryoshka prefix-consistency SFT.
+    # The reasoning network must be AdaptiveTransformerReasoningNet.
+    use_adaptive_length: bool = False
+    # Comma-separated candidate lengths, e.g. "64,128,192,256".
+    # Defaults to four equal steps up to latent_trajectory_length.
+    length_candidates: str = ""
+
     resume_from_checkpoint: Optional[str] = None
 
     dataset_name: str = "open-r1/OpenR1-Math-220k"
@@ -149,6 +158,14 @@ def load_checkpoint_if_needed(model, resume_path: str) -> None:
     print(f"Warning: no checkpoint weights found in {resume_path}")
 
 
+def _parse_length_candidates(args: "CustomSFTConfig") -> list[int]:
+    """Parse length_candidates string or derive defaults from latent_trajectory_length."""
+    if args.length_candidates:
+        return sorted(int(x.strip()) for x in args.length_candidates.split(","))
+    step = max(args.latent_trajectory_length // 4, 1)
+    return [step * i for i in range(1, 5) if step * i <= args.latent_trajectory_length]
+
+
 def build_model(training_args: CustomSFTConfig, tokenizer):
     device_map = _build_device_map()
     slow_reasoning_model = AutoModelForCausalLM.from_pretrained(
@@ -166,13 +183,27 @@ def build_model(training_args: CustomSFTConfig, tokenizer):
         hidden_size=_resolve_hidden_size(slow_reasoning_model.config),
     ).to(next(slow_reasoning_model.parameters()).device)
 
-    model = LatentTransformerReasoningModel(
-        slow_reasoning_model=slow_reasoning_model,
-        processor=tokenizer,
-        reasoning_network=reasoning_network,
-    )
+    if training_args.use_adaptive_length:
+        length_candidates = _parse_length_candidates(training_args)
+        print(f"[ALT-SFT] Matryoshka training with length_candidates={length_candidates}")
+        reasoning_network = AdaptiveTransformerReasoningNet(
+            training_args.reasoning_net_path,
+            latent_trajectory_length=training_args.latent_trajectory_length,
+            hidden_size=_resolve_hidden_size(slow_reasoning_model.config),
+            length_candidates=length_candidates,
+        ).to(next(slow_reasoning_model.parameters()).device)
+        model = AdaptiveLatentSFTModel(
+            slow_reasoning_model=slow_reasoning_model,
+            processor=tokenizer,
+            reasoning_network=reasoning_network,
+        )
+    else:
+        model = LatentTransformerReasoningModel(
+            slow_reasoning_model=slow_reasoning_model,
+            processor=tokenizer,
+            reasoning_network=reasoning_network,
+        )
     load_checkpoint_if_needed(model, training_args.resume_from_checkpoint)
-
     return model
 
 
