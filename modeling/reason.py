@@ -184,7 +184,8 @@ class LatentTransformerReasoningModel(LatentReasoningModelBase):
         input_embeddings = torch.cat([prompt_embeddings, latent_trajectory, label_embeddings], dim=1)
         input_mask = torch.cat([prompt_mask, latent_trajectory_mask, labels_mask], dim=1).long()
 
-        labels = labels.masked_fill(labels == self.pad_token_id, -100).long()
+        labels = labels.long()
+        labels = labels.masked_fill(labels_mask.to(labels.device) == 0, -100)
         labels = torch.cat((
             prompt_embeddings.new_ones(labels.size(0), prompt_embeddings.size(1)).long()*-100,
             latent_trajectory.new_ones(labels.size(0), latent_trajectory.size(1)).long()*-100,

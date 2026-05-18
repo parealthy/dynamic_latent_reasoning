@@ -7,9 +7,9 @@ AdaptiveLatentGRPOModel via a REINFORCE auxiliary loss.
 Two additions vs. the base trainer:
 
 1. _get_per_token_logps():
-   Reads self._last_trajectory_lengths from the (unwrapped) model and passes
-   them as trajectory_lengths to model.forward() so the log-probs are computed
-   with the same trajectory slice that was used during generation.
+   Passes the trajectory_lengths stored in the prepared batch to
+   model.forward(), so log-probs are computed with the same trajectory slice
+   that was used during generation.
 
 2. compute_loss():
    After the standard GRPO loss, recomputes log P(k | prompt) *with gradient*
@@ -25,8 +25,6 @@ Two additions vs. the base trainer:
 from typing import Any, Union, Optional
 
 import torch
-import torch.nn.functional as F
-from accelerate.utils import gather, gather_object
 
 from .grpo_trainer import GRPOTrainer
 from trl.trainer.utils import selective_log_softmax
@@ -60,12 +58,20 @@ class AdaptiveGRPOTrainer(GRPOTrainer):
         cached_prompt_kv=None,
         cached_prompt_hidden_states=None,
         cached_expand_idx=None,
+        trajectory_lengths: Optional[torch.Tensor] = None,
     ):
-        # Retrieve lengths chosen during the most recent generate() call.
-        unwrapped = self.accelerator.unwrap_model(model)
-        trajectory_lengths: Optional[torch.Tensor] = getattr(
-            unwrapped, "_last_trajectory_lengths", None
-        )
+        if trajectory_lengths is None:
+            # Backward-compatible fallback for older prepared batches.
+            unwrapped = self.accelerator.unwrap_model(model)
+            trajectory_lengths = getattr(unwrapped, "_last_trajectory_lengths", None)
+        else:
+            unwrapped = self.accelerator.unwrap_model(model)
+
+        rn = getattr(unwrapped, "reasoning_network", None)
+        if rn is None and hasattr(unwrapped, "_model"):
+            rn = getattr(unwrapped._model, "reasoning_network", None)
+        if rn is not None and not hasattr(rn, "difficulty_estimator"):
+            trajectory_lengths = None
 
         logits = model(
             prompt_ids=prompt_ids,
@@ -106,9 +112,7 @@ class AdaptiveGRPOTrainer(GRPOTrainer):
 
         unwrapped = self.accelerator.unwrap_model(model)
 
-        trajectory_lengths: Optional[torch.Tensor] = getattr(
-            unwrapped, "_last_trajectory_lengths", None
-        )
+        trajectory_lengths: Optional[torch.Tensor] = inputs.get("trajectory_lengths")
         cached_hs: Optional[torch.Tensor] = inputs.get("cached_prompt_hidden_states")
         expand_idx: Optional[torch.Tensor] = inputs.get("cached_expand_idx")
         advantages: torch.Tensor = inputs["advantages"]

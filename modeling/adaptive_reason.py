@@ -136,10 +136,16 @@ class DifficultyEstimator(nn.Module):
 
 class AdaptiveTransformerReasoningNet(TransformerReasoningNet):
     """
-    TransformerReasoningNet + DifficultyEstimator.
+    TransformerReasoningNet + DifficultyEstimator with *true* compute savings.
 
-    The DifficultyEstimator shares the input dtype / device with the
-    reasoning network and is initialised to a uniform prior (equal logits).
+    forward() accepts a trajectory_lengths tensor and:
+      1. Truncates the learnable self.latent_trajectory parameter to
+         max(trajectory_lengths) tokens.
+      2. Runs the reasoning transformer on (prompt + max_k) instead of
+         (prompt + 256) tokens, so the small reasoning model also benefits
+         from the budget reduction — not just the large slow model.
+      3. Applies a per-sample attention mask so samples with k_b < max_k do
+         not attend to padding positions.
     """
 
     def __init__(
@@ -160,6 +166,78 @@ class AdaptiveTransformerReasoningNet(TransformerReasoningNet):
         # Initialise with uniform prior so training starts unbiased.
         nn.init.zeros_(self.difficulty_estimator.mlp[-1].weight)
         nn.init.zeros_(self.difficulty_estimator.mlp[-1].bias)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        trajectory_lengths: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            hidden_states:       [B, prompt_len, H]
+            attention_mask:      [B, prompt_len], optional
+            trajectory_lengths:  [B] int64; if None falls back to full length.
+
+        Returns:
+            latent_trajectory:   [B, max_k, H] — max_k is the largest length
+                in trajectory_lengths (or self.latent_trajectory_length if None).
+                Positions beyond each sample's own k_b are still produced but
+                are masked so they cannot influence the slow model downstream.
+        """
+        hidden_state_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(self.reasoning_network.dtype)
+        B = hidden_states.size(0)
+
+        if trajectory_lengths is not None:
+            max_k = int(trajectory_lengths.max().item())
+        else:
+            max_k = self.latent_trajectory_length
+
+        # ---- Truncate the learnable latent_trajectory parameter ------------
+        # This is where the reasoning-network compute saving actually happens:
+        # the transformer sees prompt_len + max_k tokens instead of + 256.
+        latent_param = self.latent_trajectory[:max_k, :]  # [max_k, H]
+        latent_trajectory_base = latent_param.unsqueeze(0).expand(B, -1, -1)
+        latent_trajectory_base = latent_trajectory_base.to(self.reasoning_network.dtype)
+
+        last_hidden_state = hidden_states[:, -1:, :]
+        latent_trajectory_input = last_hidden_state * latent_trajectory_base  # [B, max_k, H]
+
+        transformed_hidden_states = self.transform_layer(hidden_states)
+        transformed_latent_trajectory = self.transform_layer(latent_trajectory_input)
+        reasoning_inputs = torch.cat(
+            [transformed_hidden_states, transformed_latent_trajectory], dim=1
+        )
+
+        reasoning_mask = None
+        if attention_mask is not None:
+            if trajectory_lengths is not None:
+                # Per-sample latent mask: 1 for j < k_b, 0 otherwise.
+                traj_range = torch.arange(
+                    max_k, device=attention_mask.device
+                ).unsqueeze(0)
+                latent_mask = (traj_range < trajectory_lengths.unsqueeze(1)).to(
+                    attention_mask.dtype
+                )
+            else:
+                latent_mask = torch.ones(
+                    B, max_k,
+                    device=attention_mask.device,
+                    dtype=attention_mask.dtype,
+                )
+            reasoning_mask = torch.cat([attention_mask, latent_mask], dim=1)
+
+        outputs = self.reasoning_network(
+            inputs_embeds=reasoning_inputs,
+            attention_mask=reasoning_mask,
+            return_dict=True,
+        )
+        latent_trajectory_output = outputs.last_hidden_state[:, -max_k:, :]
+        latent_trajectory_out = self.reverse_transform_layer(
+            latent_trajectory_output
+        ).to(hidden_state_dtype)
+        return latent_trajectory_out
 
 
 # ---------------------------------------------------------------------------
@@ -201,15 +279,22 @@ class AdaptiveLatentSFTModel(LatentTransformerReasoningModel):
                 **kwargs,
             )
 
-        latent_trajectory = self.reasoning_network(
-            prompt_hidden_states, attention_mask=prompt_mask
-        )
-
-        # ---- Matryoshka truncation ----------------------------------------
+        # ---- Matryoshka prefix length sampled BEFORE reasoning network -----
+        # Truncate before the reasoning forward so the small reasoning
+        # transformer also pays only O(prompt + k), not O(prompt + 256).
+        trajectory_lengths = None
         if self.training:
             k = random.choice(self.reasoning_network.length_candidates)
-            latent_trajectory = latent_trajectory[:, :k, :]
-        # ----------------------------------------------------------------------
+            trajectory_lengths = torch.full(
+                (input_ids.size(0),), k, dtype=torch.long, device=input_ids.device,
+            )
+        # --------------------------------------------------------------------
+
+        latent_trajectory = self.reasoning_network(
+            prompt_hidden_states,
+            attention_mask=prompt_mask,
+            trajectory_lengths=trajectory_lengths,
+        )
 
         latent_trajectory_mask = torch.ones(
             latent_trajectory.size(0), latent_trajectory.size(1),
@@ -228,7 +313,8 @@ class AdaptiveLatentSFTModel(LatentTransformerReasoningModel):
             [prompt_mask, latent_trajectory_mask, labels_mask], dim=1
         ).long()
 
-        labels = labels.masked_fill(labels == self.pad_token_id, -100).long()
+        labels = labels.long()
+        labels = labels.masked_fill(labels_mask.to(labels.device) == 0, -100)
         labels = torch.cat(
             (
                 prompt_embeddings.new_ones(
@@ -355,6 +441,125 @@ class AdaptiveLatentGRPOModel(nn.Module):
             )
         return rn.difficulty_estimator
 
+    def _get_prompt_cache(
+        self,
+        prompt_ids,
+        prompt_mask,
+        position_ids=None,
+        cached_prompt_kv=None,
+        cached_prompt_hidden_states=None,
+        cached_expand_idx=None,
+        **kwargs,
+    ):
+        m = self._model
+        if cached_prompt_kv is not None and cached_prompt_hidden_states is not None:
+            B = prompt_ids.size(0)
+            U = cached_prompt_hidden_states.size(0)
+            if U < B and cached_expand_idx is not None:
+                return (
+                    m._expand_kv_cache(cached_prompt_kv, cached_expand_idx),
+                    cached_prompt_hidden_states[cached_expand_idx],
+                )
+            return cached_prompt_kv, cached_prompt_hidden_states
+
+        with torch.no_grad():
+            prompt_emb = m.get_input_embeddings(prompt_ids).to(
+                m.slow_reasoning_model.dtype
+            )
+            prompt_out = m.slow_reasoning_model(
+                inputs_embeds=prompt_emb,
+                attention_mask=prompt_mask,
+                position_ids=position_ids,
+                return_dict=True,
+                output_hidden_states=True,
+                use_cache=True,
+                **kwargs,
+            )
+            return prompt_out.past_key_values, prompt_out.hidden_states[-1].detach()
+
+    def _forward_grouped_by_trajectory(
+        self,
+        prompt_ids,
+        prompt_mask,
+        completion_ids,
+        completion_mask=None,
+        position_ids=None,
+        cached_prompt_kv=None,
+        cached_prompt_hidden_states=None,
+        cached_expand_idx=None,
+        trajectory_lengths=None,
+        **kwargs,
+    ):
+        m = self._model
+        if completion_mask is None:
+            completion_mask = (completion_ids != m.pad_token_id).long()
+
+        prompt_mask = prompt_mask.long()
+        completion_mask = completion_mask.long()
+        trajectory_lengths = trajectory_lengths.to(prompt_ids.device).long()
+
+        prompt_kv, prompt_hidden_states = self._get_prompt_cache(
+            prompt_ids=prompt_ids,
+            prompt_mask=prompt_mask,
+            position_ids=position_ids,
+            cached_prompt_kv=cached_prompt_kv,
+            cached_prompt_hidden_states=cached_prompt_hidden_states,
+            cached_expand_idx=cached_expand_idx,
+            **kwargs,
+        )
+
+        B = prompt_ids.size(0)
+        C = completion_ids.size(1)
+        logits_out = None
+
+        for k_tensor in torch.unique(trajectory_lengths, sorted=True):
+            k = int(k_tensor.item())
+            group_idx = (trajectory_lengths == k).nonzero(as_tuple=False).flatten()
+            group_lengths = trajectory_lengths[group_idx]
+            group_prompt_kv = m._expand_kv_cache(prompt_kv, group_idx)
+            group_prompt_hidden = prompt_hidden_states[group_idx]
+            group_prompt_mask = prompt_mask[group_idx]
+            group_completion_ids = completion_ids[group_idx]
+            group_completion_mask = completion_mask[group_idx]
+
+            latent_trajectory = m.reasoning_network(
+                group_prompt_hidden,
+                attention_mask=group_prompt_mask,
+                trajectory_lengths=group_lengths,
+            ).to(m.slow_reasoning_model.dtype)
+
+            latent_mask = torch.ones(
+                latent_trajectory.size(0),
+                latent_trajectory.size(1),
+                device=group_prompt_mask.device,
+                dtype=group_prompt_mask.dtype,
+            )
+            completion_embeddings = m.get_input_embeddings(group_completion_ids).to(
+                m.slow_reasoning_model.dtype
+            )
+
+            input_embeddings = torch.cat(
+                [latent_trajectory, completion_embeddings], dim=1
+            )
+            input_mask = torch.cat(
+                [group_prompt_mask, latent_mask, group_completion_mask], dim=1
+            ).long()
+
+            outputs = m.slow_reasoning_model(
+                inputs_embeds=input_embeddings,
+                attention_mask=input_mask,
+                past_key_values=group_prompt_kv,
+                return_dict=True,
+                **kwargs,
+            )
+            group_logits = outputs.logits[:, k - 1 : k - 1 + C, :]
+
+            if logits_out is None:
+                logits_out = group_logits.new_empty(B, C, group_logits.size(-1))
+            logits_out[group_idx] = group_logits
+
+        return logits_out
+
     def _build_adaptive_grpo_inputs(
         self,
         prompt_ids,
@@ -404,16 +609,19 @@ class AdaptiveLatentGRPOModel(nn.Module):
                 prompt_hidden_states = prompt_out.hidden_states[-1].detach()
                 prompt_kv = prompt_out.past_key_values
 
-        # Compute full trajectory then truncate per-sample.
+        # Compute trajectory at the truncated length (saves compute on the
+        # reasoning network too — it sees prompt + max_k, not prompt + 256).
         latent_trajectory = m.reasoning_network(
-            prompt_hidden_states, attention_mask=prompt_mask
+            prompt_hidden_states,
+            attention_mask=prompt_mask,
+            trajectory_lengths=trajectory_lengths,
         ).to(m.slow_reasoning_model.dtype)
 
         B, L, H = latent_trajectory.shape
 
         if trajectory_lengths is not None:
             max_k = int(trajectory_lengths.max().item())
-            latent_trajectory = latent_trajectory[:, :max_k, :]
+            # latent_trajectory is already at length max_k (no further slicing).
             traj_range = torch.arange(max_k, device=prompt_mask.device).unsqueeze(0)
             latent_trajectory_mask = (traj_range < trajectory_lengths.unsqueeze(1)).long()
         else:
@@ -464,6 +672,20 @@ class AdaptiveLatentGRPOModel(nn.Module):
         kwargs.pop("logits_to_keep", None)
 
         m = self._model
+
+        if trajectory_lengths is not None:
+            return self._forward_grouped_by_trajectory(
+                prompt_ids=prompt_ids,
+                prompt_mask=prompt_mask,
+                completion_ids=completion_ids,
+                completion_mask=completion_mask,
+                position_ids=position_ids,
+                cached_prompt_kv=cached_prompt_kv,
+                cached_prompt_hidden_states=cached_prompt_hidden_states,
+                cached_expand_idx=cached_expand_idx,
+                trajectory_lengths=trajectory_lengths,
+                **kwargs,
+            )
 
         (
             prompt_mask,
@@ -562,79 +784,26 @@ class AdaptiveLatentGRPOModel(nn.Module):
         unique_hidden = prompt_out.hidden_states[-1].detach()
         unique_kv = prompt_out.past_key_values
 
+        cached_unique_hidden = unique_hidden
+        cached_unique_kv = unique_kv
+
+        # Expand prompt states before sampling k so repeated GRPO rollouts of
+        # the same prompt can explore different trajectory budgets.
+        if U < B:
+            full_hidden = unique_hidden[expand_idx]
+            full_prompt_kv = m._expand_kv_cache(unique_kv, expand_idx)
+        else:
+            full_hidden = unique_hidden
+            full_prompt_kv = unique_kv
+
         # ---- Difficulty-aware trajectory length selection ------------------
         diff_estimator = self._get_difficulty_estimator()
         temperature = self.diff_sample_temperature if self.training else 0.0
-        unique_lengths, _ = diff_estimator.select_lengths(unique_hidden, temperature)
-
-        # Expand from unique prompts to full batch.
-        if U < B:
-            trajectory_lengths = unique_lengths[expand_idx]
-        else:
-            trajectory_lengths = unique_lengths
+        trajectory_lengths, _ = diff_estimator.select_lengths(full_hidden, temperature)
 
         # Store for the trainer to retrieve.
         self._last_trajectory_lengths = trajectory_lengths
 
-        # Compute full trajectory for unique prompts, then truncate.
-        unique_latent_full = m.reasoning_network(
-            unique_hidden, attention_mask=unique_mask
-        ).to(unique_emb.dtype)
-
-        unique_max_k = int(unique_lengths.max().item())
-        unique_latent = unique_latent_full[:, :unique_max_k, :]
-
-        # Build variable-length per-unique-sample mask.
-        traj_range = torch.arange(unique_max_k, device=unique_mask.device).unsqueeze(0)
-        unique_traj_mask_part = (traj_range < unique_lengths.unsqueeze(1))
-
-        base_mask_len = unique_mask.size(1) + unique_max_k
-        unique_model_mask = torch.ones(
-            U, base_mask_len, dtype=unique_mask.dtype, device=unique_mask.device
-        )
-        unique_model_mask[:, : unique_mask.size(1)] = unique_mask
-        unique_model_mask[:, unique_mask.size(1):] = unique_traj_mask_part.long()
-        # --------------------------------------------------------------------
-
-        # Forward latent trajectory through the slow model (fill KV cache).
-        latent_out = m.slow_reasoning_model(
-            inputs_embeds=unique_latent,
-            attention_mask=unique_model_mask,
-            past_key_values=unique_kv,
-            use_cache=True,
-            return_dict=True,
-        )
-        unique_full_kv = latent_out.past_key_values
-        unique_next_logits = latent_out.logits[:, -1, :]
-
-        cached_unique_hidden = unique_hidden
-        cached_unique_kv = unique_kv
-
-        # Expand KV cache to full batch.
-        if U < B:
-            past_key_values = m._expand_kv_cache(unique_full_kv, expand_idx)
-            next_token_logits = unique_next_logits[expand_idx]
-        else:
-            past_key_values = unique_full_kv
-            next_token_logits = unique_next_logits
-
-        # Build batch-level attention mask (accounts for variable traj lengths).
-        batch_max_k = int(trajectory_lengths.max().item())
-        total_mask_len = unique_mask.size(1) + batch_max_k + max_new_tokens
-        full_attention_mask = torch.ones(
-            B, total_mask_len, dtype=prompt_mask.dtype, device=prompt_mask.device
-        )
-        full_attention_mask[:, : prompt_mask.size(1)] = prompt_mask
-        # Mark trajectory padding positions as 0 for samples with k < batch_max_k.
-        prompt_len = prompt_mask.size(1)
-        for b in range(B):
-            k_b = trajectory_lengths[b].item()
-            if k_b < batch_max_k:
-                full_attention_mask[b, prompt_len + k_b : prompt_len + batch_max_k] = 0
-
-        current_mask_len = unique_mask.size(1) + batch_max_k
-
-        # Auto-regressive decoding.
         all_tokens = torch.full(
             (B, max_new_tokens), pad_token_id, dtype=input_ids.dtype, device=input_ids.device
         )
@@ -642,47 +811,92 @@ class AdaptiveLatentGRPOModel(nn.Module):
             torch.zeros((B, max_new_tokens), dtype=torch.float32, device=input_ids.device)
             if return_logps else None
         )
-        finished = torch.zeros(B, dtype=torch.bool, device=input_ids.device)
         eos_tensor = (
             torch.tensor(eos_token_ids, device=input_ids.device) if eos_token_ids else None
         )
         actual_length = 0
 
-        for step in range(max_new_tokens):
-            if return_logps:
-                log_probs = torch.log_softmax(next_token_logits, dim=-1)
+        # Decode each selected trajectory length separately. This avoids using
+        # padded latent positions as the first completion-token context.
+        for k_tensor in torch.unique(trajectory_lengths, sorted=True):
+            k = int(k_tensor.item())
+            group_idx = (trajectory_lengths == k).nonzero(as_tuple=False).flatten()
+            group_lengths = trajectory_lengths[group_idx]
+            group_hidden = full_hidden[group_idx]
+            group_mask = prompt_mask[group_idx]
+            group_prompt_kv = m._expand_kv_cache(full_prompt_kv, group_idx)
 
-            next_tokens = m._sample_next_token(next_token_logits, generation_config)
-
-            if return_logps:
-                token_logp = log_probs.gather(1, next_tokens.unsqueeze(1)).squeeze(1)
-                token_logp = torch.where(finished, torch.zeros_like(token_logp), token_logp)
-                all_logps[:, step] = token_logp
-
-            if eos_tensor is not None:
-                is_eos = (next_tokens.unsqueeze(1) == eos_tensor.unsqueeze(0)).any(dim=1)
-            else:
-                is_eos = torch.zeros_like(finished)
-
-            next_tokens = torch.where(
-                finished, torch.full_like(next_tokens, pad_token_id), next_tokens
+            latent = m.reasoning_network(
+                group_hidden,
+                attention_mask=group_mask,
+                trajectory_lengths=group_lengths,
+            ).to(unique_emb.dtype)
+            latent_mask = torch.ones(
+                latent.size(0),
+                latent.size(1),
+                dtype=group_mask.dtype,
+                device=group_mask.device,
             )
-            all_tokens[:, step] = next_tokens
-            actual_length = step + 1
-            finished = finished | is_eos
-            if finished.all():
-                break
-
-            current_mask_len += 1
-            out = m.slow_reasoning_model(
-                input_ids=next_tokens.unsqueeze(1),
-                attention_mask=full_attention_mask[:, :current_mask_len],
-                past_key_values=past_key_values,
+            model_mask = torch.cat([group_mask, latent_mask], dim=1).long()
+            latent_out = m.slow_reasoning_model(
+                inputs_embeds=latent,
+                attention_mask=model_mask,
+                past_key_values=group_prompt_kv,
                 use_cache=True,
                 return_dict=True,
             )
-            past_key_values = out.past_key_values
-            next_token_logits = out.logits[:, -1, :]
+            past_key_values = latent_out.past_key_values
+            next_token_logits = latent_out.logits[:, -1, :]
+
+            group_size = group_idx.size(0)
+            full_attention_mask = torch.ones(
+                group_size,
+                group_mask.size(1) + k + max_new_tokens,
+                dtype=group_mask.dtype,
+                device=group_mask.device,
+            )
+            full_attention_mask[:, : group_mask.size(1)] = group_mask
+            current_mask_len = group_mask.size(1) + k
+            finished = torch.zeros(group_size, dtype=torch.bool, device=input_ids.device)
+            group_actual_length = 0
+
+            for step in range(max_new_tokens):
+                if return_logps:
+                    log_probs = torch.log_softmax(next_token_logits, dim=-1)
+
+                next_tokens = m._sample_next_token(next_token_logits, generation_config)
+
+                if return_logps:
+                    token_logp = log_probs.gather(1, next_tokens.unsqueeze(1)).squeeze(1)
+                    token_logp = torch.where(finished, torch.zeros_like(token_logp), token_logp)
+                    all_logps[group_idx, step] = token_logp
+
+                if eos_tensor is not None:
+                    is_eos = (next_tokens.unsqueeze(1) == eos_tensor.unsqueeze(0)).any(dim=1)
+                else:
+                    is_eos = torch.zeros_like(finished)
+
+                next_tokens = torch.where(
+                    finished, torch.full_like(next_tokens, pad_token_id), next_tokens
+                )
+                all_tokens[group_idx, step] = next_tokens
+                group_actual_length = step + 1
+                finished = finished | is_eos
+                if finished.all():
+                    break
+
+                current_mask_len += 1
+                out = m.slow_reasoning_model(
+                    input_ids=next_tokens.unsqueeze(1),
+                    attention_mask=full_attention_mask[:, :current_mask_len],
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                past_key_values = out.past_key_values
+                next_token_logits = out.logits[:, -1, :]
+
+            actual_length = max(actual_length, group_actual_length)
 
         completion_ids = all_tokens[:, :actual_length]
 

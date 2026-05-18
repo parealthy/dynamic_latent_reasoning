@@ -104,6 +104,8 @@ def trajectory_efficiency_reward(
 
 
 def length_penalty_reward(
+    completions: list[list[dict[str, str]]],
+    max_completion_length: int,
     completion_token_lengths: list[int] | None = None,
     **kwargs,
 ) -> list[float]:

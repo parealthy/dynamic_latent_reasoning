@@ -203,7 +203,9 @@ def build_trajectory_efficiency(
 
     def reward_wrapper(prompts, completions, solution, **kwargs):
         del prompts
-        traj_lens = getattr(model, "_last_trajectory_lengths", None)
+        traj_lens = kwargs.pop("trajectory_lengths", None)
+        if traj_lens is None:
+            traj_lens = getattr(model, "_last_trajectory_lengths", None)
         if traj_lens is None:
             return [0.0] * len(completions)
         if hasattr(traj_lens, "tolist"):

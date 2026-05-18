@@ -43,7 +43,11 @@ class GRPOTrainer(TRLGRPOTrainer):
         cached_prompt_kv=None,
         cached_prompt_hidden_states=None,
         cached_expand_idx=None,
+        trajectory_lengths=None,
     ):
+        model_kwargs = {}
+        if trajectory_lengths is not None:
+            model_kwargs["trajectory_lengths"] = trajectory_lengths
         logits = model(
             prompt_ids=prompt_ids,
             prompt_mask=prompt_mask,
@@ -53,6 +57,7 @@ class GRPOTrainer(TRLGRPOTrainer):
             cached_prompt_kv=cached_prompt_kv,
             cached_prompt_hidden_states=cached_prompt_hidden_states,
             cached_expand_idx=cached_expand_idx,
+            **model_kwargs,
         )
         if logits.size(1) != completion_ids.size(1):
             raise ValueError(
@@ -96,6 +101,9 @@ class GRPOTrainer(TRLGRPOTrainer):
                 return_logps=True,
                 return_cached_states=True,
             )
+            trajectory_lengths = getattr(unwrapped_model, "_last_trajectory_lengths", None)
+            if trajectory_lengths is not None:
+                trajectory_lengths = trajectory_lengths.to(device)
 
         is_eos = completion_ids == self.processing_class.eos_token_id
         eos_idx = torch.full(
@@ -120,6 +128,7 @@ class GRPOTrainer(TRLGRPOTrainer):
                         prompt_mask,
                         completion_ids,
                         completion_mask,
+                        trajectory_lengths=trajectory_lengths,
                     )
                 else:
                     unwrapped_model = self.accelerator.unwrap_model(self.model)
@@ -131,6 +140,7 @@ class GRPOTrainer(TRLGRPOTrainer):
                                 prompt_mask,
                                 completion_ids,
                                 completion_mask,
+                                trajectory_lengths=trajectory_lengths,
                             )
                     else:
                         ref_per_token_logps = self._get_per_token_logps(
@@ -139,6 +149,7 @@ class GRPOTrainer(TRLGRPOTrainer):
                             prompt_mask,
                             completion_ids,
                             completion_mask,
+                            trajectory_lengths=trajectory_lengths,
                         )
             # KV cache is invalidated after ref model forward; don't reuse
             cached_prompt_kv = None
@@ -171,6 +182,8 @@ class GRPOTrainer(TRLGRPOTrainer):
             keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
             reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
             reward_kwargs["completion_token_lengths"] = completion_token_lengths
+            if trajectory_lengths is not None:
+                reward_kwargs["trajectory_lengths"] = trajectory_lengths.detach().cpu().tolist()
             output_reward_func = reward_func(
                 prompts=prompts,
                 completions=completions,
@@ -266,6 +279,7 @@ class GRPOTrainer(TRLGRPOTrainer):
             "cached_prompt_kv": cached_prompt_kv,
             "cached_prompt_hidden_states": cached_prompt_hidden_states,
             "cached_expand_idx": cached_expand_idx,
+            "trajectory_lengths": trajectory_lengths,
         }
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -280,6 +294,7 @@ class GRPOTrainer(TRLGRPOTrainer):
         cached_prompt_kv = inputs.get("cached_prompt_kv")
         cached_prompt_hidden_states = inputs.get("cached_prompt_hidden_states")
         cached_expand_idx = inputs.get("cached_expand_idx")
+        trajectory_lengths = inputs.get("trajectory_lengths")
 
         per_token_logps = self._get_per_token_logps(
             model,
@@ -290,6 +305,7 @@ class GRPOTrainer(TRLGRPOTrainer):
             cached_prompt_kv=cached_prompt_kv,
             cached_prompt_hidden_states=cached_prompt_hidden_states,
             cached_expand_idx=cached_expand_idx,
+            trajectory_lengths=trajectory_lengths,
         )
 
         if self.beta != 0.0:

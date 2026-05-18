@@ -66,39 +66,20 @@ def _load_reasoning_weights(reasoning_network, checkpoint_path: str):
 
 def _last_layer_hidden_states(model, inputs_embeds, attention_mask):
     """
-    Extract the last decoder layer's output without storing all intermediate
-    hidden states, which saves memory on large models.
+    Extract the same final hidden states used during training.
+
+    The training model reads ``output.hidden_states[-1]``. Avoid forward hooks
+    here because they can capture a decoder block output before the model's
+    final normalization layer.
     """
-    captured = {}
-
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        last_layer = model.model.layers[-1]
-        base_model = model.model
-    elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
-        last_layer = model.transformer.h[-1]
-        base_model = model.transformer
-    else:
-        output = model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            return_dict=True,
-            output_hidden_states=True,
-        )
-        return output.hidden_states[-1]
-
-    def _hook(module, input, output):
-        captured["hidden_states"] = output[0] if isinstance(output, tuple) else output
-
-    handle = last_layer.register_forward_hook(_hook)
-    try:
-        base_model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-        )
-    finally:
-        handle.remove()
-
-    return captured["hidden_states"]
+    output = model(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        return_dict=True,
+        output_hidden_states=True,
+        use_cache=False,
+    )
+    return output.hidden_states[-1]
 
 
 class LatentReasoningInteractive:
