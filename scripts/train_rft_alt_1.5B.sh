@@ -6,9 +6,22 @@
 # "shortest sufficient k" preference into the advantage signal.
 set -euo pipefail
 
+# ---- Offline HF / local cache ----
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export HF_HOME="${HF_HOME:-../.hf_cache}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-../.hf_cache/datasets}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-../.hf_cache/transformers}"
+
+# LRT local dataset root used by utils/load_data.py
+export LRT_DATA_ROOT="${LRT_DATA_ROOT:-../datasets}"
+
+MODEL_ROOT="${MODEL_ROOT:-../models}"
+
 # Model
-SLOW_THINKING_MODEL_PATH="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-REASONING_NET_PATH="Qwen/Qwen3-Embedding-0.6B"
+SLOW_THINKING_MODEL_PATH="${MODEL_ROOT}/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+REASONING_NET_PATH="${MODEL_ROOT}/Qwen/Qwen3-Embedding-0.6B"
 LATENT_TRAJECTORY_LENGTH=256
 OUTPUT_DIR="checkpoints/DSR1-Qwen-1.5B-ALT-RFT"
 # Resume from the Matryoshka-SFT checkpoint produced by train_sft_alt_1.5B.sh.
@@ -66,6 +79,8 @@ fi
 
 echo "------------------------------------------------"
 echo "ALT-RFT (Difficulty-Aware GRPO) Configuration:"
+echo "  MODEL_ROOT:                   $MODEL_ROOT"
+echo "  LRT_DATA_ROOT:                $LRT_DATA_ROOT"
 echo "  USE_ADAPTIVE_LENGTH:          $USE_ADAPTIVE_LENGTH"
 echo "  LENGTH_CANDIDATES:            $LENGTH_CANDIDATES"
 echo "  DIFF_SAMPLE_TEMPERATURE:      $DIFF_SAMPLE_TEMPERATURE"
