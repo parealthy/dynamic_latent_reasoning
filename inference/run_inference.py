@@ -18,6 +18,7 @@ import os
 import sys
 import argparse
 from glob import glob
+from typing import Optional
 
 import torch
 from safetensors import safe_open
@@ -28,6 +29,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from modeling.reason import TransformerReasoningNet
+from modeling.adaptive_reason import AdaptiveTransformerReasoningNet
 
 
 def _resolve_hidden_size(config) -> int:
@@ -64,6 +66,59 @@ def _load_reasoning_weights(reasoning_network, checkpoint_path: str):
     print(f"  Loaded {len(state_dict)} reasoning network weight tensors from checkpoint.")
 
 
+def _checkpoint_has_adaptive_weights(checkpoint_path: str) -> bool:
+    """Return True if the checkpoint contains DifficultyEstimator weights."""
+    safetensor_files = glob(os.path.join(checkpoint_path, "*.safetensors"))
+    for filename in safetensor_files:
+        with safe_open(filename, framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                if key.startswith("reasoning_network.difficulty_estimator."):
+                    return True
+    return False
+
+
+def _parse_bool_auto(value: str) -> Optional[bool]:
+    value = value.lower()
+    if value == "auto":
+        return None
+    if value in ("1", "true", "yes", "y", "on"):
+        return True
+    if value in ("0", "false", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(
+        "--use_adaptive_length must be one of: auto, true, false"
+    )
+
+
+def _parse_length_candidates(
+    length_candidates: str,
+    latent_trajectory_length: int,
+) -> list[int]:
+    if length_candidates:
+        candidates = sorted(
+            {int(item.strip()) for item in length_candidates.split(",") if item.strip()}
+        )
+    else:
+        step = max(latent_trajectory_length // 4, 1)
+        candidates = [
+            step * i for i in range(1, 5)
+            if step * i <= latent_trajectory_length
+        ]
+
+    if not candidates:
+        raise ValueError("length_candidates must contain at least one length.")
+    invalid = [
+        length for length in candidates
+        if length <= 0 or length > latent_trajectory_length
+    ]
+    if invalid:
+        raise ValueError(
+            "length_candidates must be positive and no larger than "
+            f"latent_trajectory_length={latent_trajectory_length}; got {invalid}"
+        )
+    return candidates
+
+
 def _last_layer_hidden_states(model, inputs_embeds, attention_mask):
     """
     Extract the same final hidden states used during training.
@@ -96,6 +151,8 @@ class LatentReasoningInteractive:
         reasoning_net_path: str,
         checkpoint_path: str,
         latent_trajectory_length: int = 256,
+        use_adaptive_length: Optional[bool] = None,
+        length_candidates: str = "",
         prompt_max_length: int = 1024,
         max_new_tokens: int = 2048,
         device: str = "cuda",
@@ -103,6 +160,22 @@ class LatentReasoningInteractive:
         self.prompt_max_length = prompt_max_length
         self.max_new_tokens = max_new_tokens
         self.device = device
+        self.last_trajectory_lengths: Optional[torch.Tensor] = None
+
+        checkpoint_is_adaptive = _checkpoint_has_adaptive_weights(checkpoint_path)
+        if use_adaptive_length is None:
+            use_adaptive_length = checkpoint_is_adaptive
+        if checkpoint_is_adaptive and not use_adaptive_length:
+            raise ValueError(
+                "Checkpoint contains adaptive DifficultyEstimator weights, but "
+                "--use_adaptive_length=false was requested."
+            )
+        if use_adaptive_length and not checkpoint_is_adaptive:
+            raise ValueError(
+                "--use_adaptive_length=true was requested, but the checkpoint "
+                "does not contain reasoning_network.difficulty_estimator.* weights."
+            )
+        self.use_adaptive_length = use_adaptive_length
 
         # Tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -125,11 +198,27 @@ class LatentReasoningInteractive:
         # Reasoning network
         hidden_size = _resolve_hidden_size(self.model.config)
         print("  Loading reasoning network...")
-        self.reasoning_network = TransformerReasoningNet(
-            reasoning_net_path,
-            latent_trajectory_length=latent_trajectory_length,
-            hidden_size=hidden_size,
-        )
+        if self.use_adaptive_length:
+            parsed_candidates = _parse_length_candidates(
+                length_candidates,
+                latent_trajectory_length,
+            )
+            print(
+                "  Adaptive trajectory length enabled "
+                f"(candidates={parsed_candidates})."
+            )
+            self.reasoning_network = AdaptiveTransformerReasoningNet(
+                reasoning_net_path,
+                latent_trajectory_length=latent_trajectory_length,
+                hidden_size=hidden_size,
+                length_candidates=parsed_candidates,
+            )
+        else:
+            self.reasoning_network = TransformerReasoningNet(
+                reasoning_net_path,
+                latent_trajectory_length=latent_trajectory_length,
+                hidden_size=hidden_size,
+            )
         self.reasoning_network.to(device)
         self.reasoning_network.eval()
         _load_reasoning_weights(self.reasoning_network, checkpoint_path)
@@ -140,6 +229,8 @@ class LatentReasoningInteractive:
         Run latent-reasoning inference for a single user input.
         Returns the generated text.
         """
+        self.last_trajectory_lengths = None
+
         messages = [{"role": "user", "content": user_input}]
         prompt_text = self.tokenizer.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=False,
@@ -162,17 +253,46 @@ class LatentReasoningInteractive:
             self.model, prompt_embeddings, attention_mask,
         )
 
-        latent_trajectory = self.reasoning_network(
-            hidden_states, attention_mask=attention_mask,
-        ).to(prompt_embeddings.dtype)
+        trajectory_lengths = None
+        if self.use_adaptive_length:
+            trajectory_lengths, _ = (
+                self.reasoning_network.difficulty_estimator.select_lengths(
+                    hidden_states,
+                    temperature=0.0,
+                )
+            )
+            self.last_trajectory_lengths = trajectory_lengths.detach().cpu()
+
+        if trajectory_lengths is None:
+            latent_trajectory = self.reasoning_network(
+                hidden_states,
+                attention_mask=attention_mask,
+            ).to(prompt_embeddings.dtype)
+        else:
+            latent_trajectory = self.reasoning_network(
+                hidden_states,
+                attention_mask=attention_mask,
+                trajectory_lengths=trajectory_lengths,
+            ).to(prompt_embeddings.dtype)
 
         combined_embeds = torch.cat(
             [prompt_embeddings, latent_trajectory], dim=1,
         )
-        combined_mask = torch.ones(
-            1, combined_embeds.size(1),
-            dtype=torch.long, device=self.device,
+        latent_mask = torch.ones(
+            latent_trajectory.size(0),
+            latent_trajectory.size(1),
+            dtype=attention_mask.dtype,
+            device=self.device,
         )
+        if trajectory_lengths is not None:
+            traj_range = torch.arange(
+                latent_trajectory.size(1),
+                device=self.device,
+            ).unsqueeze(0)
+            latent_mask = (
+                traj_range < trajectory_lengths.to(self.device).unsqueeze(1)
+            ).to(attention_mask.dtype)
+        combined_mask = torch.cat([attention_mask, latent_mask], dim=1).long()
 
         generate_kwargs = dict(
             inputs_embeds=combined_embeds,
@@ -200,9 +320,29 @@ def parse_args():
     parser.add_argument("--reasoning_net_path", type=str, required=True)
     parser.add_argument("--checkpoint_path", type=str, required=True)
     parser.add_argument("--latent_trajectory_length", type=int, default=256)
+    parser.add_argument(
+        "--use_adaptive_length",
+        type=_parse_bool_auto,
+        default=None,
+        help=(
+            "auto/true/false. auto enables adaptive length when the checkpoint "
+            "contains DifficultyEstimator weights."
+        ),
+    )
+    parser.add_argument(
+        "--length_candidates",
+        type=str,
+        default="",
+        help="Comma-separated adaptive trajectory candidates, e.g. 64,128,192,256.",
+    )
     parser.add_argument("--max_new_tokens", type=int, default=2048)
     parser.add_argument("--prompt_max_length", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--show_trajectory_length",
+        action="store_true",
+        help="Print the selected adaptive latent trajectory length before each answer.",
+    )
     return parser.parse_args()
 
 
@@ -215,6 +355,8 @@ def main():
         reasoning_net_path=args.reasoning_net_path,
         checkpoint_path=args.checkpoint_path,
         latent_trajectory_length=args.latent_trajectory_length,
+        use_adaptive_length=args.use_adaptive_length,
+        length_candidates=args.length_candidates,
         prompt_max_length=args.prompt_max_length,
         max_new_tokens=args.max_new_tokens,
     )
@@ -235,6 +377,9 @@ def main():
 
         try:
             answer = model.generate(user_input, temperature=args.temperature)
+            if args.show_trajectory_length and model.last_trajectory_lengths is not None:
+                lengths = model.last_trajectory_lengths.tolist()
+                print(f"\n[latent_trajectory_length={lengths[0]}]")
             print(f"\n{answer}\n")
         except KeyboardInterrupt:
             print("\n[Generation interrupted]\n")
